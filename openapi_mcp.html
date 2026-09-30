@@ -1,0 +1,715 @@
+#!/usr/bin/env python3
+"""OpenAPI / Postman spec explorer — MCP server in a single file.
+
+Transports:
+  python3 openapi_mcp.py                          # MCP over stdio (Claude Code / Desktop)
+  python3 openapi_mcp.py --http --port 8765       # MCP over Streamable HTTP (remote / API connector)
+  python3 openapi_mcp.py call search '{"query":"pet"}'   # plain CLI, no MCP client needed
+  python3 openapi_mcp.py tools-json [openai]      # print tool definitions (Anthropic or OpenAI format)
+
+Only dependency: PyYAML (for .yaml specs). Python 3.9+.
+"""
+import argparse
+import json
+import os
+import re
+import sys
+import threading
+import uuid
+
+try:
+    import yaml
+except ImportError:  # JSON specs still work without PyYAML
+    yaml = None
+
+SERVER_NAME = "openapi-explorer"
+SERVER_VERSION = "1.0.0"
+PROTOCOL_VERSIONS = ["2025-06-18", "2025-03-26", "2024-11-05"]
+HTTP_METHODS = ["get", "put", "post", "delete", "options", "head", "patch", "trace"]
+SKIP_DIRS = {".git", ".claude", "node_modules", "__pycache__", "web", "examples", ".venv", "venv"}
+MAX_CHARS = int(os.environ.get("OPENAPI_MCP_MAX_CHARS", "40000"))
+MAX_REF_DEPTH = int(os.environ.get("OPENAPI_MCP_REF_DEPTH", "6"))
+
+
+def log(*args):
+    print("[openapi-mcp]", *args, file=sys.stderr, flush=True)
+
+
+# ---------------------------------------------------------------------------
+# Loading & normalizing specs
+# ---------------------------------------------------------------------------
+
+def _read_doc(path):
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    if path.lower().endswith(".json"):
+        doc = json.loads(text)
+    else:
+        if yaml is None:
+            raise RuntimeError("PyYAML is required for YAML specs: pip install pyyaml")
+        doc = yaml.safe_load(text)
+    # Round-trip through JSON: stringifies int keys (e.g. 200) and dates.
+    return json.loads(json.dumps(doc, default=str)), text
+
+
+def _spec_kind(doc):
+    if not isinstance(doc, dict):
+        return None
+    if "openapi" in doc:
+        return "openapi " + str(doc["openapi"])
+    if "swagger" in doc:
+        return "swagger " + str(doc["swagger"])
+    info = doc.get("info")
+    if isinstance(info, dict) and "postman" in str(info.get("schema", "")):
+        return "postman"
+    return None
+
+
+def _normalize_openapi(doc):
+    ops = []
+
+    def add_ops(path, item, webhook=False):
+        if not isinstance(item, dict):
+            return
+        common = item.get("parameters", [])
+        for m in HTTP_METHODS:
+            op = item.get(m)
+            if not isinstance(op, dict):
+                continue
+            ops.append({
+                "method": m.upper(),
+                "path": path,
+                "operationId": op.get("operationId") or "%s %s" % (m.upper(), path),
+                "summary": op.get("summary", ""),
+                "description": op.get("description", ""),
+                "tags": op.get("tags", []),
+                "deprecated": bool(op.get("deprecated")),
+                "webhook": webhook,
+                "parameters": common + op.get("parameters", []),
+                "requestBody": op.get("requestBody"),
+                "responses": op.get("responses", {}),
+                "security": op.get("security", doc.get("security")),
+                "callbacks": op.get("callbacks"),
+                "_raw": op,
+            })
+
+    for path, item in (doc.get("paths") or {}).items():
+        add_ops(path, item)
+    for name, item in (doc.get("webhooks") or {}).items():
+        add_ops("webhook:" + name, item, webhook=True)
+
+    comps = doc.get("components") or {}
+    schemas = comps.get("schemas") or doc.get("definitions") or {}
+    sec = comps.get("securitySchemes") or doc.get("securityDefinitions") or {}
+    return {
+        "info": doc.get("info", {}),
+        "servers": doc.get("servers") or ([{"url": doc.get("host", "") + doc.get("basePath", "")}] if "host" in doc else []),
+        "securitySchemes": sec,
+        "security": doc.get("security"),
+        "tags": doc.get("tags", []),
+        "operations": ops,
+        "schemas": schemas,
+    }
+
+
+def _pm_text(v):
+    if isinstance(v, dict):
+        return v.get("content", "")
+    return v or ""
+
+
+def _normalize_postman(doc):
+    ops = []
+    variables = {v.get("key"): v.get("value") for v in doc.get("variable", []) if isinstance(v, dict)}
+    coll_auth = doc.get("auth")
+
+    def conv_path(url):
+        if isinstance(url, str):
+            raw = url
+            segs = re.sub(r"^\{\{[^}]+\}\}", "", raw.split("?")[0]).strip("/").split("/")
+        else:
+            segs = url.get("path", []) or []
+        out = []
+        for s in segs:
+            s = str(s)
+            if s.startswith(":"):
+                s = "{%s}" % s[1:]
+            s = re.sub(r"\{\{([^}]+)\}\}", r"{\1}", s)
+            out.append(s)
+        return "/" + "/".join(x for x in out if x)
+
+    def walk(items, tags):
+        for it in items:
+            if "item" in it:
+                walk(it["item"], tags + [it.get("name", "")])
+                continue
+            req = it.get("request") or {}
+            if isinstance(req, str):
+                req = {"method": "GET", "url": req}
+            url = req.get("url") or ""
+            params = []
+            if isinstance(url, dict):
+                for q in url.get("query", []) or []:
+                    params.append({"in": "query", "name": q.get("key"), "example": q.get("value"),
+                                   "description": _pm_text(q.get("description"))})
+                for v in url.get("variable", []) or []:
+                    params.append({"in": "path", "name": v.get("key"), "example": v.get("value"),
+                                   "description": _pm_text(v.get("description"))})
+            for h in req.get("header", []) or []:
+                if str(h.get("key", "")).lower() in ("accept", "content-type"):
+                    continue
+                params.append({"in": "header", "name": h.get("key"), "example": h.get("value"),
+                               "description": _pm_text(h.get("description"))})
+            body = req.get("body")
+            if isinstance(body, dict):
+                mode = body.get("mode")
+                body = {"mode": mode, "content": body.get(mode), "options": body.get("options")}
+            responses = {}
+            for r in it.get("response", []) or []:
+                code = str(r.get("code", "default"))
+                responses.setdefault(code, []).append({
+                    "name": r.get("name"),
+                    "headers": {h.get("key"): h.get("value") for h in r.get("header", []) or []
+                                if isinstance(h, dict)},
+                    "body": r.get("body"),
+                })
+            method = req.get("method", "GET").upper()
+            path = conv_path(url)
+            ops.append({
+                "method": method,
+                "path": path,
+                "operationId": re.sub(r"[^A-Za-z0-9]+", "_", it.get("name", "")).strip("_") or "%s %s" % (method, path),
+                "summary": it.get("name", ""),
+                "description": _pm_text(req.get("description")),
+                "tags": [t for t in tags if t][-1:],
+                "deprecated": False,
+                "webhook": False,
+                "parameters": params,
+                "requestBody": body,
+                "responses": responses,
+                "security": req.get("auth") or coll_auth,
+                "rawUrl": url.get("raw") if isinstance(url, dict) else url,
+                "_raw": it,
+            })
+
+    walk(doc.get("item", []), [])
+    info = doc.get("info", {})
+    return {
+        "info": {"title": info.get("name"), "description": _pm_text(info.get("description")),
+                 "version": info.get("version", "")},
+        "servers": [{"url": v, "variable": k} for k, v in variables.items() if "url" in k.lower()],
+        "securitySchemes": {"collection": coll_auth} if coll_auth else {},
+        "security": coll_auth,
+        "tags": [{"name": i.get("name"), "description": _pm_text(i.get("description"))}
+                 for i in doc.get("item", []) if "item" in i],
+        "variables": variables,
+        "operations": ops,
+        "schemas": {},
+    }
+
+
+class Registry:
+    """Discovers specs under a directory and reloads them when files change."""
+
+    def __init__(self, root):
+        self.root = os.path.abspath(root)
+        self.specs = {}
+        self._sig = None
+        self._lock = threading.Lock()
+
+    def _scan(self):
+        found = []
+        for dirpath, dirnames, filenames in os.walk(self.root):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS and not d.startswith(".")]
+            for fn in filenames:
+                if fn.lower().endswith((".yaml", ".yml", ".json")):
+                    p = os.path.join(dirpath, fn)
+                    try:
+                        found.append((p, os.path.getmtime(p)))
+                    except OSError:
+                        pass
+        return sorted(found)
+
+    def get(self):
+        with self._lock:
+            files = self._scan()
+            if files != self._sig:
+                self._sig = files
+                self._load([p for p, _ in files])
+            return self.specs
+
+    def _load(self, paths):
+        specs = {}
+        for p in paths:
+            try:
+                doc, text = _read_doc(p)
+            except Exception as e:  # noqa: BLE001 — skip unreadable files, keep serving the rest
+                if p.lower().endswith((".yaml", ".yml")) or "openapi" in os.path.basename(p).lower():
+                    log("skip", p, e)
+                continue
+            kind = _spec_kind(doc)
+            if not kind:
+                continue
+            norm = _normalize_postman(doc) if kind == "postman" else _normalize_openapi(doc)
+            rel = os.path.relpath(p, self.root)
+            parent = os.path.basename(os.path.dirname(p)) if os.path.dirname(rel) else ""
+            stem = re.sub(r"[^A-Za-z0-9_-]+", "-", os.path.splitext(os.path.basename(p))[0]).strip("-")
+            name = parent or stem
+            if name in specs:
+                name = "%s-%s" % (parent, stem) if parent else stem
+            norm.update({"name": name, "file": rel, "format": kind, "doc": doc, "text": text})
+            specs[name] = norm
+        self.specs = specs
+        log("loaded %d spec(s) from %s: %s" % (len(specs), self.root, ", ".join(specs)))
+
+
+# ---------------------------------------------------------------------------
+# $ref resolution & helpers
+# ---------------------------------------------------------------------------
+
+def _pointer(doc, ref):
+    if not ref.startswith("#/"):
+        raise KeyError(ref)
+    node = doc
+    for part in ref[2:].split("/"):
+        part = part.replace("~1", "/").replace("~0", "~")
+        node = node[part]
+    return node
+
+
+def resolve(node, doc, depth=0, stack=()):
+    """Inline local $refs. Cycles and deep nesting are left as {"$ref": ...} markers."""
+    if isinstance(node, list):
+        return [resolve(x, doc, depth, stack) for x in node]
+    if not isinstance(node, dict):
+        return node
+    ref = node.get("$ref")
+    if isinstance(ref, str):
+        if ref in stack:
+            return {"$ref": ref, "note": "circular"}
+        if depth >= MAX_REF_DEPTH:
+            return {"$ref": ref, "note": "depth limit - call get_schema for details"}
+        try:
+            target = _pointer(doc, ref)
+        except (KeyError, TypeError, IndexError):
+            return {"$ref": ref, "note": "unresolved"}
+        out = {"x-ref": ref.split("/")[-1]}
+        out.update(resolve(target, doc, depth + 1, stack + (ref,)))
+        for k, v in node.items():  # 3.1 allows siblings next to $ref
+            if k != "$ref":
+                out[k] = resolve(v, doc, depth, stack)
+        return out
+    return {k: resolve(v, doc, depth, stack) for k, v in node.items()}
+
+
+def _clip(s, n=300):
+    s = s or ""
+    if not isinstance(s, str):
+        s = json.dumps(s, ensure_ascii=False)
+    s = " ".join(s.split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def _dump(obj):
+    s = json.dumps(obj, ensure_ascii=False, indent=1)
+    if len(s) > MAX_CHARS:
+        s = s[:MAX_CHARS] + "\n… [truncated at %d chars; ask for a narrower item]" % MAX_CHARS
+    return s
+
+
+class ToolError(Exception):
+    pass
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+TOOLS = [
+    {
+        "name": "list_specs",
+        "description": "List every loaded API spec (OpenAPI/Swagger/Postman) with title, version, format and endpoint count. Call this first to learn spec names.",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_spec_info",
+        "description": "Overview of one spec: description, servers/base URLs, authentication schemes, tags, variables.",
+        "inputSchema": {"type": "object", "properties": {
+            "spec": {"type": "string", "description": "Spec name from list_specs"}},
+            "required": ["spec"]},
+    },
+    {
+        "name": "list_operations",
+        "description": "Compact list of endpoints (method, path, operationId, summary). Filter by spec, tag and/or HTTP method.",
+        "inputSchema": {"type": "object", "properties": {
+            "spec": {"type": "string", "description": "Spec name; omit for all specs"},
+            "tag": {"type": "string", "description": "Only operations with this tag (case-insensitive)"},
+            "method": {"type": "string", "description": "Only this HTTP method, e.g. GET"}}},
+    },
+    {
+        "name": "search",
+        "description": "Keyword search across endpoints (path, operationId, summary, description, tags, parameter names) and schema names. Use to find the right endpoint for a question.",
+        "inputSchema": {"type": "object", "properties": {
+            "query": {"type": "string", "description": "Keywords, e.g. 'upload pet image' or 'order status'"},
+            "spec": {"type": "string", "description": "Limit to one spec"},
+            "limit": {"type": "integer", "description": "Max results (default 15)"}},
+            "required": ["query"]},
+    },
+    {
+        "name": "get_operation",
+        "description": "Full detail of one endpoint with $refs resolved: parameters, request body schema/examples, responses, auth and servers. Identify it by operationId, or by path + method.",
+        "inputSchema": {"type": "object", "properties": {
+            "spec": {"type": "string", "description": "Spec name (optional if operationId is unique)"},
+            "operationId": {"type": "string"},
+            "path": {"type": "string", "description": "e.g. /pet/{petId}"},
+            "method": {"type": "string", "description": "e.g. GET"}}},
+    },
+    {
+        "name": "get_schema",
+        "description": "A named schema/model (components.schemas) with $refs resolved.",
+        "inputSchema": {"type": "object", "properties": {
+            "spec": {"type": "string"},
+            "name": {"type": "string", "description": "Schema name, e.g. Pet"}},
+            "required": ["spec", "name"]},
+    },
+]
+
+
+def _spec(specs, name):
+    if name in specs:
+        return specs[name]
+    for k, v in specs.items():  # forgiving match
+        if k.lower() == str(name).lower() or str(name).lower() in (v.get("info", {}).get("title") or "").lower():
+            return v
+    raise ToolError("Unknown spec %r. Available: %s" % (name, ", ".join(specs) or "(none)"))
+
+
+def _op_summary(spec, op):
+    d = {"spec": spec["name"], "method": op["method"], "path": op["path"],
+         "operationId": op["operationId"], "summary": _clip(op["summary"] or op["description"], 140)}
+    if op["tags"]:
+        d["tags"] = op["tags"]
+    if op["deprecated"]:
+        d["deprecated"] = True
+    return d
+
+
+def t_list_specs(specs, a):
+    return [{"spec": s["name"], "title": s["info"].get("title"), "version": s["info"].get("version"),
+             "format": s["format"], "file": s["file"], "operations": len(s["operations"]),
+             "schemas": len(s["schemas"])} for s in specs.values()]
+
+
+def t_get_spec_info(specs, a):
+    s = _spec(specs, a.get("spec"))
+    out = {"spec": s["name"], "format": s["format"], "file": s["file"],
+           "info": {k: v for k, v in s["info"].items() if k != "description"},
+           "description": _clip(s["info"].get("description"), 3000),
+           "servers": s["servers"], "securitySchemes": s["securitySchemes"],
+           "globalSecurity": s["security"],
+           "tags": [{"name": t.get("name"), "description": _clip(t.get("description"), 200)} for t in s["tags"]],
+           "operationCount": len(s["operations"]), "schemaNames": sorted(s["schemas"])}
+    if s.get("variables"):
+        out["variables"] = s["variables"]
+    return out
+
+
+def t_list_operations(specs, a):
+    targets = [_spec(specs, a["spec"])] if a.get("spec") else list(specs.values())
+    tag, method = (a.get("tag") or "").lower(), (a.get("method") or "").upper()
+    return [_op_summary(s, op) for s in targets for op in s["operations"]
+            if (not tag or tag in [str(t).lower() for t in op["tags"]])
+            and (not method or op["method"] == method)]
+
+
+def t_search(specs, a):
+    q = (a.get("query") or "").lower().strip()
+    if not q:
+        raise ToolError("query is required")
+    words = [w for w in re.split(r"[^a-z0-9ğüşöçıİ]+", q) if w]
+    targets = [_spec(specs, a["spec"])] if a.get("spec") else list(specs.values())
+
+    def score(fields):
+        total = 0
+        for text, weight in fields:
+            t = (text or "").lower() if isinstance(text, str) else json.dumps(text).lower()
+            if q in t:
+                total += weight * 2
+            total += sum(weight for w in words if w in t)
+        return total
+
+    hits = []
+    for s in targets:
+        for op in s["operations"]:
+            sc = score([(op["path"], 3), (op["operationId"], 3), (op["summary"], 2),
+                        (" ".join(map(str, op["tags"])), 2), (op["description"], 1),
+                        (" ".join(str(p.get("name", "")) for p in op["parameters"] if isinstance(p, dict)), 1)])
+            if sc:
+                hits.append((sc, dict(_op_summary(s, op), kind="operation")))
+        for name, sch in s["schemas"].items():
+            sc = score([(name, 3), (sch.get("description", "") if isinstance(sch, dict) else "", 1)])
+            if sc:
+                hits.append((sc, {"kind": "schema", "spec": s["name"], "name": name,
+                                  "description": _clip(sch.get("description") if isinstance(sch, dict) else "", 140)}))
+    hits.sort(key=lambda h: -h[0])
+    return [dict(h, score=sc) for sc, h in hits[: int(a.get("limit") or 15)]]
+
+
+def t_get_operation(specs, a):
+    oid, path, method = a.get("operationId"), a.get("path"), (a.get("method") or "").upper()
+    if not oid and not path:
+        raise ToolError("Provide operationId, or path (+ method)")
+    targets = [_spec(specs, a["spec"])] if a.get("spec") else list(specs.values())
+    matches = []
+    for s in targets:
+        for op in s["operations"]:
+            if oid and op["operationId"].lower() == oid.lower():
+                matches.append((s, op))
+            elif path and op["path"] == path and (not method or op["method"] == method):
+                matches.append((s, op))
+    if not matches:
+        raise ToolError("No operation found. Use search or list_operations to find the right identifier.")
+    if len(matches) > 1:
+        return {"ambiguous": [_op_summary(s, op) for s, op in matches],
+                "hint": "Specify spec and/or method."}
+    s, op = matches[0]
+    doc = s["doc"]
+    out = {k: v for k, v in op.items() if not k.startswith("_") and v not in (None, "", [], {})}
+    out["spec"] = s["name"]
+    out["parameters"] = resolve(op["parameters"], doc)
+    if op["requestBody"]:
+        out["requestBody"] = resolve(op["requestBody"], doc)
+    out["responses"] = resolve(op["responses"], doc)
+    if op.get("callbacks"):
+        out["callbacks"] = resolve(op["callbacks"], doc, depth=MAX_REF_DEPTH - 1)
+    sec = op.get("security")
+    if sec and s["format"] != "postman":
+        names = {n for req in sec for n in req} if isinstance(sec, list) else set()
+        out["securitySchemesUsed"] = {n: s["securitySchemes"].get(n) for n in names}
+    out["servers"] = op["_raw"].get("servers") or s["servers"] if isinstance(op["_raw"], dict) else s["servers"]
+    return out
+
+
+def t_get_schema(specs, a):
+    s = _spec(specs, a.get("spec"))
+    name = a.get("name")
+    sch = s["schemas"].get(name)
+    if sch is None:
+        low = {k.lower(): k for k in s["schemas"]}
+        if str(name).lower() in low:
+            name = low[str(name).lower()]
+            sch = s["schemas"][name]
+    if sch is None:
+        raise ToolError("Schema %r not found in %s. Available: %s" % (name, s["name"], ", ".join(sorted(s["schemas"])) or "(none)"))
+    base = "#/components/schemas/" if "components" in s["doc"] else "#/definitions/"
+    return {"spec": s["name"], "name": name, "schema": resolve(sch, s["doc"], stack=(base + name,))}
+
+
+HANDLERS = {
+    "list_specs": t_list_specs, "get_spec_info": t_get_spec_info, "list_operations": t_list_operations,
+    "search": t_search, "get_operation": t_get_operation, "get_schema": t_get_schema,
+}
+
+
+def call_tool(registry, name, args):
+    """Run a tool; returns (text, is_error). Shared by MCP, CLI and the API example."""
+    fn = HANDLERS.get(name)
+    if not fn:
+        return "Unknown tool %r" % name, True
+    try:
+        return _dump(fn(registry.get(), args or {})), False
+    except ToolError as e:
+        return str(e), True
+    except Exception as e:  # noqa: BLE001 — surface as tool error, keep server alive
+        return "%s: %s" % (type(e).__name__, e), True
+
+
+def anthropic_tools():
+    """Tool definitions in Anthropic Messages API format."""
+    return [{"name": t["name"], "description": t["description"], "input_schema": t["inputSchema"]} for t in TOOLS]
+
+
+def openai_tools():
+    """Tool definitions in OpenAI Chat Completions format (OpenAI, Venice, OpenRouter, Ollama, ...)."""
+    return [{"type": "function", "function": {"name": t["name"], "description": t["description"],
+                                              "parameters": t["inputSchema"]}} for t in TOOLS]
+
+
+# ---------------------------------------------------------------------------
+# MCP JSON-RPC
+# ---------------------------------------------------------------------------
+
+def _result(mid, result):
+    return {"jsonrpc": "2.0", "id": mid, "result": result}
+
+
+def _error(mid, code, msg):
+    return {"jsonrpc": "2.0", "id": mid, "error": {"code": code, "message": msg}}
+
+
+def handle(registry, msg):
+    """Handle one JSON-RPC message. Returns a response dict, or None for notifications."""
+    if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0":
+        return _error(None, -32600, "Invalid Request")
+    mid, method, params = msg.get("id"), msg.get("method"), msg.get("params") or {}
+    if mid is None and method:  # notification (initialized, cancelled, ...)
+        return None
+    if method is None:  # a response to something we never sent
+        return None
+
+    if method == "initialize":
+        want = params.get("protocolVersion")
+        return _result(mid, {
+            "protocolVersion": want if want in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
+            "capabilities": {"tools": {"listChanged": False}, "resources": {}},
+            "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+            "instructions": "Query API specs: list_specs -> search -> get_operation / get_schema. "
+                            "Answer only from spec content.",
+        })
+    if method == "ping":
+        return _result(mid, {})
+    if method == "tools/list":
+        return _result(mid, {"tools": TOOLS})
+    if method == "tools/call":
+        text, is_err = call_tool(registry, params.get("name"), params.get("arguments"))
+        return _result(mid, {"content": [{"type": "text", "text": text}], "isError": is_err})
+    if method == "resources/list":
+        return _result(mid, {"resources": [
+            {"uri": "spec://" + s["name"], "name": s["name"], "description": "%s (%s)" % (s["info"].get("title"), s["file"]),
+             "mimeType": "application/json" if s["file"].endswith(".json") else "application/yaml"}
+            for s in registry.get().values()]})
+    if method == "resources/read":
+        uri = params.get("uri", "")
+        s = registry.get().get(uri.replace("spec://", "", 1))
+        if not s:
+            return _error(mid, -32002, "Resource not found: " + uri)
+        return _result(mid, {"contents": [{"uri": uri, "text": s["text"],
+                                           "mimeType": "application/json" if s["file"].endswith(".json") else "application/yaml"}]})
+    if method in ("prompts/list", "resources/templates/list"):
+        return _result(mid, {"prompts": []} if method == "prompts/list" else {"resourceTemplates": []})
+    return _error(mid, -32601, "Method not found: %s" % method)
+
+
+def handle_payload(registry, payload):
+    if isinstance(payload, list):  # JSON-RPC batch
+        out = [r for r in (handle(registry, m) for m in payload) if r is not None]
+        return out or None
+    return handle(registry, payload)
+
+
+def serve_stdio(registry):
+    log("stdio transport ready")
+    for line in sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            resp = handle_payload(registry, json.loads(line))
+        except json.JSONDecodeError:
+            resp = _error(None, -32700, "Parse error")
+        if resp is not None:
+            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+            sys.stdout.flush()
+
+
+def serve_http(registry, host, port, token):
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    from urllib.parse import urlparse
+
+    class Handler(BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *args):
+            log("http", fmt % args)
+
+        def _send(self, code, body=None, headers=None):
+            data = b"" if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+            self.send_response(code)
+            if body is not None:
+                self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            for k, v in (headers or {}).items():
+                self.send_header(k, v)
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _authorized(self):
+            if token:
+                return self.headers.get("Authorization", "") == "Bearer " + token
+            # No token: refuse cross-site browser requests (DNS-rebinding protection).
+            origin = self.headers.get("Origin")
+            return not origin or urlparse(origin).hostname in ("localhost", "127.0.0.1", "::1")
+
+        def do_GET(self):
+            if self.path.rstrip("/") == "/health":
+                return self._send(200, {"ok": True, "specs": list(registry.get())})
+            self._send(405, None, {"Allow": "POST"})  # no server-initiated SSE stream
+
+        def do_DELETE(self):
+            self._send(200 if self._authorized() else 401)
+
+        def do_POST(self):
+            if urlparse(self.path).path.rstrip("/") not in ("", "/mcp"):
+                return self._send(404, {"error": "use POST /mcp"})
+            if not self._authorized():
+                return self._send(401, {"error": "unauthorized"}, {"WWW-Authenticate": "Bearer"})
+            n = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(n) or b"null")
+            except json.JSONDecodeError:
+                return self._send(400, _error(None, -32700, "Parse error"))
+            resp = handle_payload(registry, payload)
+            if resp is None:
+                return self._send(202)
+            headers = {}
+            if isinstance(payload, dict) and payload.get("method") == "initialize":
+                headers["Mcp-Session-Id"] = uuid.uuid4().hex
+            self._send(200, resp, headers)
+
+    srv = ThreadingHTTPServer((host, port), Handler)
+    log("streamable HTTP on http://%s:%d/mcp%s" % (host, port, " (bearer token required)" if token else ""))
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="OpenAPI/Postman spec explorer MCP server")
+    ap.add_argument("command", nargs="*", help="empty = MCP server | call <tool> [json] | tools-json [anthropic|openai]")
+    ap.add_argument("--specs-dir", default=os.environ.get("SPECS_DIR") or os.path.dirname(os.path.abspath(__file__)))
+    ap.add_argument("--http", action="store_true", help="serve Streamable HTTP instead of stdio")
+    ap.add_argument("--host", default=os.environ.get("MCP_HOST", "127.0.0.1"))
+    ap.add_argument("--port", type=int, default=int(os.environ.get("MCP_PORT", "8765")))
+    ap.add_argument("--token", default=os.environ.get("MCP_TOKEN"), help="require Authorization: Bearer <token>")
+    a = ap.parse_args(argv)
+    registry = Registry(a.specs_dir)
+
+    if a.command and a.command[0] == "call":
+        if len(a.command) < 2:
+            ap.error("usage: call <tool> ['{json args}']")
+        args = json.loads(a.command[2]) if len(a.command) > 2 else {}
+        text, is_err = call_tool(registry, a.command[1], args)
+        print(text)
+        return 1 if is_err else 0
+    if a.command and a.command[0] == "tools-json":
+        fmt = a.command[1] if len(a.command) > 1 else "anthropic"
+        print(json.dumps(openai_tools() if fmt == "openai" else anthropic_tools(), indent=2))
+        return 0
+    if a.command:
+        ap.error("unknown command %r" % a.command[0])
+
+    registry.get()
+    if a.http:
+        serve_http(registry, a.host, a.port, a.token)
+    else:
+        serve_stdio(registry)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
