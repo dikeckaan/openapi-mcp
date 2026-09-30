@@ -1,4 +1,7 @@
-#!/usr/bin/env python3
+<!doctype html>
+<html lang="tr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>openapi_mcp.py — Copy code</title>
+<style>body{margin:0;background:#10141c;color:#e6edf3;font:16px system-ui}main{max-width:1100px;margin:auto;padding:32px 20px}header{display:flex;align-items:center;gap:16px;flex-wrap:wrap}h1{font-size:24px;margin-right:auto}button{background:#73e2bd;color:#10231d;border:0;border-radius:8px;padding:12px 20px;font:600 16px system-ui;cursor:pointer}button:focus-visible{outline:3px solid white;outline-offset:4px}p{color:#adb8c8}pre{background:#191f2b;border:1px solid #303a4a;border-radius:12px;padding:24px;overflow:auto;font:14px/1.6 monospace;tab-size:4}#status{min-height:24px}</style></head>
+<body><main><header><h1>openapi_mcp.py</h1><button id="copy" type="button">Click to copy</button></header><p>Python kaynak kodu. Kopyalayıp openapi_mcp.py adıyla kaydedebilirsin.</p><p id="status" role="status" aria-live="polite"></p><pre><code id="source">#!/usr/bin/env python3
 """OpenAPI / Postman spec explorer — MCP server in a single file.
 
 Transports:
@@ -36,7 +39,7 @@ def log(*args):
 
 
 # ---------------------------------------------------------------------------
-# Loading & normalizing specs
+# Loading &amp; normalizing specs
 # ---------------------------------------------------------------------------
 
 def _read_doc(path):
@@ -264,7 +267,7 @@ class Registry:
 
 
 # ---------------------------------------------------------------------------
-# $ref resolution & helpers
+# $ref resolution &amp; helpers
 # ---------------------------------------------------------------------------
 
 def _pointer(doc, ref):
@@ -287,7 +290,7 @@ def resolve(node, doc, depth=0, stack=()):
     if isinstance(ref, str):
         if ref in stack:
             return {"$ref": ref, "note": "circular"}
-        if depth >= MAX_REF_DEPTH:
+        if depth &gt;= MAX_REF_DEPTH:
             return {"$ref": ref, "note": "depth limit - call get_schema for details"}
         try:
             target = _pointer(doc, ref)
@@ -307,12 +310,12 @@ def _clip(s, n=300):
     if not isinstance(s, str):
         s = json.dumps(s, ensure_ascii=False)
     s = " ".join(s.split())
-    return s if len(s) <= n else s[: n - 1] + "…"
+    return s if len(s) &lt;= n else s[: n - 1] + "…"
 
 
 def _dump(obj):
     s = json.dumps(obj, ensure_ascii=False, indent=1)
-    if len(s) > MAX_CHARS:
+    if len(s) &gt; MAX_CHARS:
         s = s[:MAX_CHARS] + "\n… [truncated at %d chars; ask for a narrower item]" % MAX_CHARS
     return s
 
@@ -469,7 +472,7 @@ def t_get_operation(specs, a):
                 matches.append((s, op))
     if not matches:
         raise ToolError("No operation found. Use search or list_operations to find the right identifier.")
-    if len(matches) > 1:
+    if len(matches) &gt; 1:
         return {"ambiguous": [_op_summary(s, op) for s, op in matches],
                 "hint": "Specify spec and/or method."}
     s, op = matches[0]
@@ -563,7 +566,7 @@ def handle(registry, msg):
             "protocolVersion": want if want in PROTOCOL_VERSIONS else PROTOCOL_VERSIONS[0],
             "capabilities": {"tools": {"listChanged": False}, "resources": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
-            "instructions": "Query API specs: list_specs -> search -> get_operation / get_schema. "
+            "instructions": "Query API specs: list_specs -&gt; search -&gt; get_operation / get_schema. "
                             "Answer only from spec content.",
         })
     if method == "ping":
@@ -680,24 +683,24 @@ def serve_http(registry, host, port, token):
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="OpenAPI/Postman spec explorer MCP server")
-    ap.add_argument("command", nargs="*", help="empty = MCP server | call <tool> [json] | tools-json [anthropic|openai]")
+    ap.add_argument("command", nargs="*", help="empty = MCP server | call &lt;tool&gt; [json] | tools-json [anthropic|openai]")
     ap.add_argument("--specs-dir", default=os.environ.get("SPECS_DIR") or os.path.dirname(os.path.abspath(__file__)))
     ap.add_argument("--http", action="store_true", help="serve Streamable HTTP instead of stdio")
     ap.add_argument("--host", default=os.environ.get("MCP_HOST", "127.0.0.1"))
     ap.add_argument("--port", type=int, default=int(os.environ.get("MCP_PORT", "8765")))
-    ap.add_argument("--token", default=os.environ.get("MCP_TOKEN"), help="require Authorization: Bearer <token>")
+    ap.add_argument("--token", default=os.environ.get("MCP_TOKEN"), help="require Authorization: Bearer &lt;token&gt;")
     a = ap.parse_args(argv)
     registry = Registry(a.specs_dir)
 
     if a.command and a.command[0] == "call":
-        if len(a.command) < 2:
-            ap.error("usage: call <tool> ['{json args}']")
-        args = json.loads(a.command[2]) if len(a.command) > 2 else {}
+        if len(a.command) &lt; 2:
+            ap.error("usage: call &lt;tool&gt; ['{json args}']")
+        args = json.loads(a.command[2]) if len(a.command) &gt; 2 else {}
         text, is_err = call_tool(registry, a.command[1], args)
         print(text)
         return 1 if is_err else 0
     if a.command and a.command[0] == "tools-json":
-        fmt = a.command[1] if len(a.command) > 1 else "anthropic"
+        fmt = a.command[1] if len(a.command) &gt; 1 else "anthropic"
         print(json.dumps(openai_tools() if fmt == "openai" else anthropic_tools(), indent=2))
         return 0
     if a.command:
@@ -713,3 +716,23 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+</code></pre></main>
+<script>
+document.getElementById('copy').addEventListener('click',async()=>{
+ const source=document.getElementById('source');
+ const status=document.getElementById('status');
+ const text=source.textContent;
+ try{
+  if(navigator.clipboard && window.isSecureContext){await navigator.clipboard.writeText(text);}
+  else{
+   const area=document.createElement('textarea');area.value=text;area.style.position='fixed';area.style.opacity='0';document.body.appendChild(area);area.select();
+   const ok=document.execCommand('copy');area.remove();if(!ok)throw new Error('copy failed');
+  }
+  status.textContent='Kod kopyalandı.';document.getElementById('copy').textContent='Copied!';
+  setTimeout(()=>document.getElementById('copy').textContent='Click to copy',2000);
+ }catch{
+  const range=document.createRange();range.selectNodeContents(source);const selection=window.getSelection();selection.removeAllRanges();selection.addRange(range);
+  status.textContent='Otomatik kopyalama kullanılamıyor. Kod seçildi; Ctrl+C veya ⌘C ile kopyalayabilirsin.';
+ }
+});
+</script></body></html>
